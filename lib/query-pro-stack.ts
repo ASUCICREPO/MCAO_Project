@@ -25,6 +25,7 @@ import { Construct } from "constructs";
 import * as cdk from "aws-cdk-lib";
 import * as subs from "aws-cdk-lib/aws-sns-subscriptions";
 import * as sm from "aws-cdk-lib/aws-sagemaker";
+import { PublicSubnet } from "aws-cdk-lib/aws-ec2";
 
 export class QueryProStack extends Stack {
   constructor(scope: Construct, id: string, props?: StackProps) {
@@ -217,30 +218,68 @@ export class QueryProStack extends Stack {
       new SqsEventSource(s3_textrract_complete_queue)
     );
 
-    const vpc = ec2.Vpc.fromLookup(this, "ExistingVpc", {
-      vpcId: "vpc-0d86631672278708e", // Replace with your VPC ID
+    const ecrRepoNameParam = new cdk.CfnParameter(this, 'ECRRepoName', {
+      type: 'String',
+      description: 'Name of the ECR repository',
     });
 
-    // Import existing subnets
-    const subnets = vpc.selectSubnets({
-      subnetFilters: [
-        ec2.SubnetFilter.byIds(["subnet-0bf4dab65864fe6d3", "subnet-0577d87588a7b373f"]), // Replace with your Subnet IDs
+    const vpc_2 = new ec2.Vpc(this, "Vpc_mcao", {
+      ipAddresses: ec2.IpAddresses.cidr('10.0.0.0/16'),
+      maxAzs: 2,
+      natGateways: 1,
+      subnetConfiguration: [
+        {
+          name: "public_sub",
+          subnetType: ec2.SubnetType.PUBLIC,
+        },
       ],
+    })
+
+    const egressOnlyGateway = new ec2.CfnEgressOnlyInternetGateway(this, 'project321-eigw', {
+      vpcId: vpc_2.vpcId,
     });
 
-    // Import existing security group
-    const securityGroup = ec2.SecurityGroup.fromSecurityGroupId(this, "ExistingSecurityGroup", "sg-01602a563435263e3"); // Replace with your Security Group ID
+    vpc_2.addGatewayEndpoint('S3GatewayEndpoint', {
+      service: ec2.GatewayVpcEndpointAwsService.S3,
+      subnets: [{ subnetType: ec2.SubnetType.PUBLIC }],  // Public subnets will have access to S3 via this endpoint
+    });
+
+
+    const security_group2 = new ec2.SecurityGroup(this, "mcao_security_group2", {
+      vpc: vpc_2,
+      allowAllOutbound: true,
+      allowAllIpv6Outbound: true,
+      description: "mcao_security_group2",
+      securityGroupName: "mcao_security_group2",
+    });
+
+    security_group2.addIngressRule(
+      ec2.Peer.anyIpv4(),
+      ec2.Port.allTraffic(),
+      "Allow access to all ports"
+    );
+
+    security_group2.addIngressRule(
+      ec2.Peer.anyIpv6(),
+      ec2.Port.allTraffic(),
+      "Allow access to all ports"
+    );
 
     // Import existing load balancer
-    const loadBalancer = elbv2.ApplicationLoadBalancer.fromApplicationLoadBalancerAttributes(this, "ExistingLoadBalancer", {
-      loadBalancerArn: "arn:aws:elasticloadbalancing:us-east-1:500608964291:loadbalancer/app/mcao-lb/e530a024f9ea0085", // Replace with your Load Balancer ARN
-      securityGroupId: securityGroup.securityGroupId,
+    const alb = new elbv2.ApplicationLoadBalancer(this, 'MyALB', {
+      vpc: vpc_2,
+      internetFacing: true,  // This ALB is publicly accessible
+      loadBalancerName: 'mcao-lb',
+      securityGroup: security_group2,
+      vpcSubnets: {
+        subnetType: ec2.SubnetType.PUBLIC,  // This ALB will be in public subnets
+      },
     });
 
 
     const cluster = new ecs.Cluster(this, "EcsCluster", {
-      vpc,
-      clusterName: "ganesh_3_cluster",
+      vpc:vpc_2,
+      clusterName: "mcao_cluster",
     });
 
     const taskRole = new iam.Role(this, "TaskRole", {
@@ -266,28 +305,39 @@ export class QueryProStack extends Stack {
       memoryLimitMiB: 3072,
       cpu: 1024,
       taskRole,
-      executionRole
+      executionRole,
+      runtimePlatform: {
+        operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
+        cpuArchitecture: ecs.CpuArchitecture.ARM64,
+      },
     });
 
     const container = taskDefinition.addContainer("mcao-streamlit", {
-      image: ecs.ContainerImage.fromRegistry("public.ecr.aws/h9e1x4p1/mcao-streamlit:latest"),
+      image: ecs.ContainerImage.fromRegistry(ecrRepoNameParam.valueAsString),
       memoryLimitMiB: 3072,
       cpu: 1024,
       logging: ecs.LogDriver.awsLogs({ streamPrefix: "mcao" }),
+      
     });
 
     container.addPortMappings({
       containerPort: 8501,
     });
 
-    const targetGroup = elbv2.ApplicationTargetGroup.fromTargetGroupAttributes(this, 'ImportedTargetGroup', {
-      targetGroupArn: "arn:aws:elasticloadbalancing:us-east-1:500608964291:targetgroup/ecs-ganesh-mcao-service/728fdd3a220912ed",
+    const targetGroup = new elbv2.ApplicationTargetGroup(this, 'MyTargetGroup', {
+      vpc: vpc_2,
+      port: 8501,
+      protocol: elbv2.ApplicationProtocol.HTTP,
+      targetType: elbv2.TargetType.IP
     });
 
+    
     // Import existing listener
-    const listener = elbv2.ApplicationListener.fromApplicationListenerAttributes(this, "ExistingListener", {
-      listenerArn: "arn:aws:elasticloadbalancing:region:account-id:listener/app/load-balancer-name/50dc6c495c0c9188/6f72db3c709f0c8f", // Replace with your Listener ARN
-      securityGroup: securityGroup,
+    const listener = alb.addListener('Listener', {
+      port: 8501,
+      protocol: elbv2.ApplicationProtocol.HTTP,
+      open: true,  // Allows traffic from anywhere
+      defaultTargetGroups: [targetGroup],
     });
 
     const fargateService = new ecs.FargateService(this, "ECSService", {
@@ -295,21 +345,25 @@ export class QueryProStack extends Stack {
       taskDefinition,
       desiredCount: 1,
       serviceName: "mcao-service",
-      securityGroups: [securityGroup],
+      securityGroups: [security_group2],
       assignPublicIp: true,
-      vpcSubnets: { subnets: subnets.subnets },
+      // Assign public subnet
+      vpcSubnets: {
+
+          // This ALB will be in public subnets
+      },
       healthCheckGracePeriod: cdk.Duration.seconds(60)
     });
     fargateService.attachToApplicationTargetGroup(targetGroup);
 
-    new cdk.CfnOutput(this, "LoadBalancerDNS", {
-      value: `http://mcao-lb-1093413639.us-east-1.elb.amazonaws.com:8501`,
-      description: "DNS name of the load balancer",
-    });
+    // new cdk.CfnOutput(this, "LoadBalancerDNS", {
+    //   value: alb.loadBalancerDnsName,
+    //   description: "DNS name of the load balancer",
+    // });
 
     // Output the name of the S3 bucket
     new cdk.CfnOutput(this, 'BucketName', {
-      value: 'queryprostack-mybucketf68f3ff0-piigxfelaa5j',
+      value: myBucket.bucketName,
     });
   }
 }
